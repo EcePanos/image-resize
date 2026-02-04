@@ -3,8 +3,9 @@ from flask import Flask, request, jsonify, Response
 from minio import Minio
 from minio.error import S3Error
 from io import BytesIO
-from threading import Thread
-from PIL import Image
+import os
+
+import pika
 
 
 app = Flask(__name__)
@@ -29,28 +30,27 @@ for bucket in [UPLOAD_BUCKET, RESIZED_BUCKET]:
         minio_client.make_bucket(bucket)
 
 
-# Async resize function for MinIO
-def resize_image_async(object_name):
+
+# RabbitMQ config
+RABBITMQ_HOST = os.environ.get('RABBITMQ_HOST', 'rabbitmq')
+RABBITMQ_QUEUE = 'image_jobs'
+
+def submit_job_to_queue(object_name):
     try:
-        # Download original image from MinIO
-        data = minio_client.get_object(UPLOAD_BUCKET, object_name)
-        img = Image.open(BytesIO(data.read()))
-        img.thumbnail((400, 300), Image.LANCZOS)
-        img = img.convert("RGB")
-        buf = BytesIO()
-        img.save(buf, format="JPEG")
-        buf.seek(0)
-        # Save resized image to MinIO
-        resized_name = f"resized_{object_name.rsplit('.', 1)[0]}.jpg"
-        minio_client.put_object(
-            RESIZED_BUCKET,
-            resized_name,
-            buf,
-            length=buf.getbuffer().nbytes,
-            content_type="image/jpeg"
+        print(f"[DEBUG] Preparing to publish job: object_name={object_name} type={type(object_name)}")
+        connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+        channel = connection.channel()
+        channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
+        channel.basic_publish(
+            exchange='',
+            routing_key=RABBITMQ_QUEUE,
+            body=object_name.encode(),
+            properties=pika.BasicProperties(delivery_mode=2)  # make message persistent
         )
+        print(f"[DEBUG] Published job to queue {RABBITMQ_QUEUE}: {object_name}")
+        connection.close()
     except Exception as e:
-        print(f"Resize error: {e}")
+        print(f"Failed to submit job to queue: {e}")
 
 @app.route('/api/upload', methods=['POST'])
 def upload_image():
@@ -69,8 +69,8 @@ def upload_image():
         length=file_stream.getbuffer().nbytes,
         content_type=file.mimetype
     )
-    Thread(target=resize_image_async, args=(object_name,)).start()
-    return jsonify({'message': 'Image received, resizing in background.'}), 202
+    submit_job_to_queue(object_name)
+    return jsonify({'message': 'Image received, job submitted for processing.'}), 202
 
 
 # Serve resized images from MinIO
