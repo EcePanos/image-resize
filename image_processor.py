@@ -31,17 +31,29 @@ def resize_image(image_path, output_path, size=(256, 256)):
         img.save(output_path)
 
 def process_job(ch, method, properties, body):
-    filename = body.decode()
-    print(f"Processing job for {filename}")
 
-    # Create temporary paths for processing
-    input_path = os.path.join(UPLOADS_DIR, filename)
-    output_path = os.path.join(RESIZED_DIR, filename)
-
+    import json
     try:
-        # Download the image from MinIO's 'uploads' bucket
-        minio_client.fget_object('uploads', filename, input_path)
+        event = json.loads(body.decode())
+        # MinIO event format: extract bucket and object key
+        record = event['Records'][0]
+        bucket_name = record['s3']['bucket']['name']
+        filename = record['s3']['object']['key']
+        print(f"Processing job for {filename} in bucket {bucket_name}")
+
+        input_path = os.path.join(UPLOADS_DIR, os.path.basename(filename))
+        output_path = os.path.join(RESIZED_DIR, os.path.basename(filename))
+
+
+        # Download the image from MinIO
+        minio_client.fget_object(bucket_name, filename, input_path)
         print(f"Successfully downloaded {filename} from MinIO.")
+        # Print file size for debugging
+        try:
+            file_size = os.path.getsize(input_path)
+            print(f"Downloaded file size: {file_size} bytes")
+        except Exception as e:
+            print(f"Error checking file size: {e}")
 
         # Resize the image
         resize_image(input_path, output_path)
@@ -51,11 +63,11 @@ def process_job(ch, method, properties, body):
         ensure_bucket()
 
         # Upload the resized image to the 'resized-images' bucket
-        minio_client.fput_object(BUCKET_NAME, filename, output_path)
+        minio_client.fput_object(BUCKET_NAME, os.path.basename(filename), output_path)
         print(f"Successfully uploaded resized {filename} to MinIO.")
 
     except Exception as e:
-        print(f"Error processing {filename}: {e}")
+        print(f"Error processing event: {e}")
 
     # Acknowledge the message
     ch.basic_ack(delivery_tag=method.delivery_tag)
@@ -81,10 +93,14 @@ def main():
         try:
             connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
             channel = connection.channel()
-            channel.queue_declare(queue='image_jobs', durable=True)
+            # Declare the queue and bind to minio-events exchange
+            queue_name = 'minio_events_queue'
+            channel.queue_declare(queue=queue_name, durable=True)
+            channel.exchange_declare(exchange='minio-events', exchange_type='fanout', durable=True)
+            channel.queue_bind(queue=queue_name, exchange='minio-events', routing_key='minio.uploaded')
             channel.basic_qos(prefetch_count=1)
-            channel.basic_consume(queue='image_jobs', on_message_callback=process_job)
-            print('Waiting for image jobs...')
+            channel.basic_consume(queue=queue_name, on_message_callback=process_job)
+            print('Waiting for MinIO event jobs...')
             channel.start_consuming()
         except pika.exceptions.AMQPConnectionError as e:
             print(f"Connection error: {e}, retrying in 5s...")

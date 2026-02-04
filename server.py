@@ -1,4 +1,4 @@
-
+from datetime import timedelta
 from flask import Flask, request, jsonify, Response
 from minio import Minio
 from minio.error import S3Error
@@ -89,6 +89,34 @@ def list_resized_images():
     objects = minio_client.list_objects(RESIZED_BUCKET)
     images = [obj.object_name for obj in objects if obj.object_name.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
     return jsonify({'images': images})
+
+# Generate a presigned URL for uploading to MinIO
+@app.route('/api/presigned-upload', methods=['POST'])
+def presigned_upload():
+    data = request.get_json()
+    if not data or 'filename' not in data:
+        return jsonify({'error': 'Missing filename'}), 400
+    filename = data['filename']
+    content_type = data.get('content_type', 'application/octet-stream')
+    try:
+        url = minio_client.presigned_put_object(
+            UPLOAD_BUCKET,
+            filename,
+            expires=timedelta(minutes=10)
+        )
+        # Patch the URL to use nginx /minio/ path for external access
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(url)
+        # Replace scheme and netloc with nginx endpoint, and prefix path with /minio
+        external_base = os.environ.get('MINIO_EXTERNAL_BASE', 'http://localhost:8080/minio')
+        ext_parsed = urlparse(external_base)
+        # Remove leading slash from parsed.path to avoid double slashes
+        minio_path = parsed.path.lstrip('/')
+        new_path = ext_parsed.path.rstrip('/') + '/' + minio_path
+        new_url = urlunparse((ext_parsed.scheme, ext_parsed.netloc, new_path, parsed.params, parsed.query, parsed.fragment))
+        return jsonify({'url': new_url, 'method': 'PUT', 'headers': {'Content-Type': content_type}})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':

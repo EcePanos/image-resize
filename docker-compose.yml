@@ -42,6 +42,14 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_NOTIFY_AMQP_ENABLE_1: "on"
+      MINIO_NOTIFY_AMQP_URL_1: "amqp://guest:guest@rabbitmq:5672/"
+      MINIO_NOTIFY_AMQP_EXCHANGE_1: "minio-events"
+      MINIO_NOTIFY_AMQP_ROUTING_KEY_1: "minio.uploaded"
+      MINIO_NOTIFY_AMQP_EXCHANGE_TYPE_1: "fanout"
+      MINIO_NOTIFY_AMQP_DURABLE_1: "on"
+      MINIO_NOTIFY_AMQP_USERNAME_1: "guest"
+      MINIO_NOTIFY_AMQP_PASSWORD_1: "guest"
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data

@@ -28,11 +28,28 @@ export default function App() {
     e.preventDefault();
     if (!selectedFile) return;
     setUploading(true);
-    const formData = new FormData();
-    formData.append('image', selectedFile);
-    await fetch('/api/upload', {
+    // Step 1: Request presigned URL
+    const res = await fetch('/api/presigned-upload', {
       method: 'POST',
-      body: formData,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: selectedFile.name,
+        content_type: selectedFile.type || 'application/octet-stream',
+      }),
+    });
+    const data = await res.json();
+    if (!data.url) {
+      alert('Failed to get presigned URL');
+      setUploading(false);
+      return;
+    }
+    // Step 2: Upload file directly to MinIO
+    await fetch(data.url, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': selectedFile.type || 'application/octet-stream',
+      },
+      body: selectedFile,
     });
     setUploading(false);
     setSelectedFile(null);
