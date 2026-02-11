@@ -1,0 +1,7 @@
+flask
+minio
+pika
+psycopg2-binary
+Pillow
+pytest
+

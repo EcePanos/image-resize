@@ -26,16 +26,20 @@ minio_client = Minio(
     secure=False
 )
 
-# Ensure buckets exist
-for bucket in [UPLOAD_BUCKET, RESIZED_BUCKET]:
-    if not minio_client.bucket_exists(bucket):
-        minio_client.make_bucket(bucket)
+# Allow tests (and some environments) to skip external initialisation
+SKIP_EXTERNAL_INIT = os.environ.get("SKIP_EXTERNAL_INIT") == "1"
 
-# Initialise database schema
-try:
-    init_db()
-except Exception as e:
-    print(f"[WARN] Failed to initialise database: {e}")
+if not SKIP_EXTERNAL_INIT:
+    # Ensure buckets exist
+    for bucket in [UPLOAD_BUCKET, RESIZED_BUCKET]:
+        if not minio_client.bucket_exists(bucket):
+            minio_client.make_bucket(bucket)
+
+    # Initialise database schema
+    try:
+        init_db()
+    except Exception as e:
+        print(f"[WARN] Failed to initialise database: {e}")
 
 
 @app.route('/api/upload', methods=['POST'])
