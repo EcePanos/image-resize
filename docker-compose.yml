@@ -11,6 +11,11 @@ services:
       - "5000:5000"
     environment:
       - FLASK_ENV=development
+      - DATABASE_URL=postgresql://image_resize:image_resize@db:5432/image_resize
+    depends_on:
+      - db
+    networks:
+      - image-resize-network
   frontend:
     build:
       context: ./frontend
@@ -21,7 +26,8 @@ services:
       - backend
     environment:
       - VITE_API_URL=http://backend:5000
-
+    networks:
+      - image-resize-network
 
   nginx:
     image: nginx:alpine
@@ -33,7 +39,8 @@ services:
     depends_on:
       - frontend
       - backend
-
+    networks:
+      - image-resize-network
   minio:
     image: minio/minio:latest
     ports:
@@ -53,7 +60,8 @@ services:
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
-
+    networks:
+      - image-resize-network
   rabbitmq:
     image: rabbitmq:3-management
     ports:
@@ -62,7 +70,8 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
-
+    networks:
+      - image-resize-network
   image-processor:
     build:
       context: .
@@ -70,6 +79,7 @@ services:
     depends_on:
       - rabbitmq
       - minio
+      - db
     volumes:
       - ./uploads:/app/uploads
       - ./resized:/app/resized
@@ -77,6 +87,24 @@ services:
       - RABBITMQ_HOST=rabbitmq
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=minioadmin
-
+      - DATABASE_URL=postgresql://image_resize:image_resize@db:5432/image_resize
+    networks:
+      - image-resize-network
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: image_resize
+      POSTGRES_PASSWORD: image_resize
+      POSTGRES_DB: image_resize
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - image-resize-network
 volumes:
   minio_data:
+  pgdata:
+networks:
+  image-resize-network:
+    driver: bridge

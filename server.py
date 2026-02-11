@@ -1,11 +1,15 @@
 from datetime import timedelta
+from io import BytesIO
+import json
+import os
+import uuid
+
+import pika
 from flask import Flask, request, jsonify, Response
 from minio import Minio
 from minio.error import S3Error
-from io import BytesIO
-import os
 
-import pika
+from db import init_db, create_job, get_job
 
 
 app = Flask(__name__)
@@ -29,25 +33,38 @@ for bucket in [UPLOAD_BUCKET, RESIZED_BUCKET]:
     if not minio_client.bucket_exists(bucket):
         minio_client.make_bucket(bucket)
 
+# Initialise database schema
+try:
+    init_db()
+except Exception as e:
+    print(f"[WARN] Failed to initialise database: {e}")
 
 
 # RabbitMQ config
 RABBITMQ_HOST = os.environ.get('RABBITMQ_HOST', 'rabbitmq')
 RABBITMQ_QUEUE = 'image_jobs'
 
-def submit_job_to_queue(object_name):
+
+def submit_job_to_queue(job_id: str, bucket_name: str, object_name: str):
+    """Send a job message to the existing RabbitMQ queue."""
+    payload = {
+        "job_id": job_id,
+        "bucket": bucket_name,
+        "object_name": object_name,
+    }
+    body = json.dumps(payload).encode("utf-8")
     try:
-        print(f"[DEBUG] Preparing to publish job: object_name={object_name} type={type(object_name)}")
+        print(f"[DEBUG] Preparing to publish job: {payload}")
         connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
         channel = connection.channel()
         channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
         channel.basic_publish(
             exchange='',
             routing_key=RABBITMQ_QUEUE,
-            body=object_name.encode(),
+            body=body,
             properties=pika.BasicProperties(delivery_mode=2)  # make message persistent
         )
-        print(f"[DEBUG] Published job to queue {RABBITMQ_QUEUE}: {object_name}")
+        print(f"[DEBUG] Published job to queue {RABBITMQ_QUEUE}: {payload}")
         connection.close()
     except Exception as e:
         print(f"Failed to submit job to queue: {e}")
@@ -69,8 +86,28 @@ def upload_image():
         length=file_stream.getbuffer().nbytes,
         content_type=file.mimetype
     )
-    submit_job_to_queue(object_name)
-    return jsonify({'message': 'Image received, job submitted for processing.'}), 202
+    # Create DB job in 'pending' state (best-effort) and enqueue the job.
+    job_id = None
+    try:
+        job_id = create_job(filename=object_name, original_filename=file.filename)
+    except Exception as e:
+        # Fall back to a generated id so the queue can still carry a job id
+        job_id = str(uuid.uuid4())
+        print(f"[WARN] Failed to create DB job for upload, using ad-hoc id {job_id}: {e}")
+
+    # Enqueue job for processing via existing RabbitMQ queue (best-effort).
+    try:
+        submit_job_to_queue(job_id, UPLOAD_BUCKET, object_name)
+    except Exception as e:
+        print(f"[WARN] Failed to enqueue job {job_id} for {object_name}: {e}")
+    return jsonify(
+        {
+            'message': 'Image received, job submitted for processing.',
+            'job_id': job_id,
+            'status': 'pending',
+            'object_name': object_name,
+        }
+    ), 202
 
 
 # Serve resized images from MinIO
@@ -98,6 +135,9 @@ def presigned_upload():
         return jsonify({'error': 'Missing filename'}), 400
     filename = data['filename']
     content_type = data.get('content_type', 'application/octet-stream')
+
+    # First, generate the presigned URL. If this fails, the client truly
+    # cannot upload, so we return an error.
     try:
         url = minio_client.presigned_put_object(
             UPLOAD_BUCKET,
@@ -114,9 +154,46 @@ def presigned_upload():
         minio_path = parsed.path.lstrip('/')
         new_path = ext_parsed.path.rstrip('/') + '/' + minio_path
         new_url = urlunparse((ext_parsed.scheme, ext_parsed.netloc, new_path, parsed.params, parsed.query, parsed.fragment))
-        return jsonify({'url': new_url, 'method': 'PUT', 'headers': {'Content-Type': content_type}})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+    # Then, best-effort create a DB job and enqueue it. If this fails we
+    # still return a working upload URL so the frontend UX is not broken.
+    job_id = None
+    try:
+        job_id = create_job(filename=filename, original_filename=filename)
+    except Exception as e:
+        job_id = str(uuid.uuid4())
+        print(f"[WARN] Failed to create DB job for presigned upload, using ad-hoc id {job_id}: {e}")
+
+    try:
+        submit_job_to_queue(job_id, UPLOAD_BUCKET, filename)
+    except Exception as e:
+        print(f"[WARN] Failed to enqueue job {job_id} for presigned upload {filename}: {e}")
+
+    response_payload = {
+        'url': new_url,
+        'method': 'PUT',
+        'headers': {'Content-Type': content_type},
+        'object_name': filename,
+    }
+    if job_id:
+        response_payload.update(
+            {
+                'job_id': job_id,
+                'status': 'pending',
+            }
+        )
+    return jsonify(response_payload)
+
+
+@app.route('/api/jobs/<job_id>', methods=['GET'])
+def job_status(job_id):
+    """Return the current status and metadata for an image job."""
+    job = get_job(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(job)
 
 
 if __name__ == '__main__':
