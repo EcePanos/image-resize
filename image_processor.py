@@ -2,6 +2,7 @@ import json
 import os
 import time
 import socket
+from urllib.parse import unquote
 
 import pika
 from minio import Minio
@@ -12,7 +13,6 @@ from db import init_db, update_job_status
 
 
 RABBITMQ_HOST = os.environ.get('RABBITMQ_HOST', 'localhost')
-RABBITMQ_QUEUE = 'image_jobs'
 MINIO_ROOT_USER = os.environ.get('MINIO_ROOT_USER', 'minioadmin')
 MINIO_ROOT_PASSWORD = os.environ.get('MINIO_ROOT_PASSWORD', 'minioadmin')
 MINIO_ENDPOINT = os.environ.get('MINIO_ENDPOINT', 'minio:9000')
@@ -49,16 +49,33 @@ def safe_update_job_status(job_id: str, status: str, error_message: str | None =
         print(f"[WARN] Failed to update job {job_id} to '{status}': {e}")
 
 
+def extract_job_id_from_key(object_key: str) -> str | None:
+    """
+    Our server stores objects as '<job_id>_<original-filename>'.
+    This helper extracts the job_id part for status tracking.
+    """
+    base = os.path.basename(object_key)
+    if '_' not in base:
+        return None
+    job_id, _rest = base.split('_', 1)
+    return job_id or None
+
+
 def process_job(ch, method, properties, body):
     try:
-        message = json.loads(body.decode())
-        job_id = message["job_id"]
-        bucket_name = message["bucket"]
-        filename = message["object_name"]
-        print(f"Processing queued job {job_id} for {filename} in bucket {bucket_name}")
+        event = json.loads(body.decode())
+        record = event['Records'][0]
+        bucket_name = record['s3']['bucket']['name']
+        raw_key = record['s3']['object']['key']
+        # MinIO/S3 events URL-encode object keys; decode before use
+        filename = unquote(raw_key)
+
+        job_id = extract_job_id_from_key(filename)
+        print(f"Processing MinIO event for {filename} in bucket {bucket_name}, job_id={job_id}")
 
         # Mark job as in progress (best-effort)
-        safe_update_job_status(job_id, "in_progress")
+        if job_id:
+            safe_update_job_status(job_id, "in_progress")
 
         input_path = os.path.join(UPLOADS_DIR, os.path.basename(filename))
         output_path = os.path.join(RESIZED_DIR, os.path.basename(filename))
@@ -99,14 +116,18 @@ def process_job(ch, method, properties, body):
         print(f"Successfully uploaded resized {filename} to MinIO.")
 
         # Mark job as completed (best-effort)
-        safe_update_job_status(job_id, "completed")
+        if job_id:
+            safe_update_job_status(job_id, "completed")
 
     except Exception as e:
-        print(f"Error processing job: {e}")
+        print(f"Error processing MinIO event: {e}")
+        # Best-effort: try to recover job_id from the event again
         try:
-            # Best-effort: extract job id and store error
-            message = json.loads(body.decode())
-            job_id = message.get("job_id")
+            event = json.loads(body.decode())
+            record = event['Records'][0]
+            raw_key = record['s3']['object']['key']
+            filename = unquote(raw_key)
+            job_id = extract_job_id_from_key(filename)
             if job_id:
                 safe_update_job_status(job_id, "error", error_message=str(e))
         except Exception as inner:
@@ -142,11 +163,14 @@ def main():
         try:
             connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
             channel = connection.channel()
-            # Declare the existing image_jobs queue
-            channel.queue_declare(queue=RABBITMQ_QUEUE, durable=True)
+            # Declare the queue and bind to minio-events exchange
+            queue_name = 'minio_events_queue'
+            channel.queue_declare(queue=queue_name, durable=True)
+            channel.exchange_declare(exchange='minio-events', exchange_type='fanout', durable=True)
+            channel.queue_bind(queue=queue_name, exchange='minio-events', routing_key='minio.uploaded')
             channel.basic_qos(prefetch_count=1)
-            channel.basic_consume(queue=RABBITMQ_QUEUE, on_message_callback=process_job)
-            print(f'Waiting for queued image jobs on "{RABBITMQ_QUEUE}"...')
+            channel.basic_consume(queue=queue_name, on_message_callback=process_job)
+            print('Waiting for MinIO event jobs...')
             channel.start_consuming()
         except pika.exceptions.AMQPConnectionError as e:
             print(f"Connection error: {e}, retrying in 5s...")

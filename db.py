@@ -43,9 +43,14 @@ def init_db():
         conn.close()
 
 
-def create_job(filename: str, original_filename: str | None = None) -> str:
+def create_job(
+    filename: str,
+    original_filename: str | None = None,
+    job_id: str | None = None,
+) -> str:
     """Insert a new image job with status 'pending' and return its UUID."""
-    job_id = str(uuid.uuid4())
+    if job_id is None:
+        job_id = str(uuid.uuid4())
     conn = get_connection()
     try:
         with conn, conn.cursor() as cur:
